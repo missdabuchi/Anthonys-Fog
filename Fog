@@ -1,0 +1,1826 @@
+-- Anthony's Fog Color Changer (client-side) -- Themed Edition v4
+-- Tabbed UI (Presets / Fog / Light / Style), 8 UI themes, 39 fog presets, smooth fading
+-- Fonts: Chicken Pie, Matcha Mint, Coffee Spark, Hello Valentina, Sunny Spells, Soul Billani
+-- LocalScript (StarterPlayerScripts / StarterGui) or executor-friendly
+-- Open / close the window with the round button or with RightShift.
+
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local Lighting = game:GetService("Lighting")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local SoundService = game:GetService("SoundService")
+local ContentProvider = game:GetService("ContentProvider")
+local RunService = game:GetService("RunService")
+
+local localPlayer = Players.LocalPlayer
+local playerGui = localPlayer:WaitForChild("PlayerGui")
+
+-- ============================================================================
+-- Config
+-- ============================================================================
+
+local GUI_NAME = "AnthonysFogColorChangerGui"
+
+-- Title bar logo. By default it is DRAWN in code (a gear with a drop) so it always shows up and
+-- recolors with every UI theme (matcha = soft green, sakura = pink, ...).
+-- To use your own uploaded image instead: USE_IMAGE_ICON = true + its IMAGE asset id (not a Decal id).
+-- The image is tinted with the theme color, so a white / silver image works best.
+local USE_IMAGE_ICON = false
+local ICON_ID = 108451699729029
+
+-- Theme the UI starts with:
+-- "Matcha", "Sakura", "Coffee", "Fall", "Ocean", "Lavender", "Cloud" or "Midnight"
+local DEFAULT_THEME = "Matcha"
+
+-- How long a fog preset takes to fade in (seconds). 0 = instant. Also a slider in the UI.
+local DEFAULT_FADE_TIME = 1.2
+
+-- Font the MENU starts with (the game's own text is only changed when you pick a font yourself):
+-- "chicken_pie", "matcha_mint", "coffee_spark", "hello_valentina", "sunny_spells", "soul_billani"
+local DEFAULT_FONT = "chicken_pie"
+
+-- When you pick a font in the Style tab, also change the text of the game's own UI (PlayerGui)?
+local APPLY_FONT_TO_GAME = true
+
+-- Only for Roblox Studio / your own game (no executor): upload a font as a Font asset and
+-- put its asset id (numbers only) here, e.g. chicken_pie = 123456789. Not needed with an executor.
+local FONT_ASSET_IDS = {
+	-- chicken_pie = nil,
+	-- matcha_mint = nil,
+	-- coffee_spark = nil,
+	-- hello_valentina = nil,
+	-- sunny_spells = nil,
+	-- soul_billani = nil,
+}
+
+-- Should fog presets also recolor the ambient light? (Both are switches on the Presets tab too.)
+local PRESET_SETS_AMBIENT = false
+local PRESET_SETS_OUTDOOR_AMBIENT = false
+
+-- Toast shown right after the script runs
+local STARTUP_TOAST = "Successfully executed!"
+
+-- Sounds (built-in Roblox client sounds, so they always exist)
+local NOTIFY_SOUND_ID = "rbxasset://sounds/electronicpingshort.wav"
+local CLICK_SOUND_ID = "rbxasset://sounds/button.wav"
+
+-- Icon loader tries these in order until one loads
+local ICON_CANDIDATES = (USE_IMAGE_ICON and ICON_ID) and {
+	"rbxthumb://type=Asset&id=" .. ICON_ID .. "&w=150&h=150",
+	"rbxassetid://" .. ICON_ID,
+	"http://www.roblox.com/asset/?id=" .. ICON_ID,
+} or {}
+
+local function loadIcon(label, onDone)
+	task.spawn(function()
+		for _, candidate in ipairs(ICON_CANDIDATES) do
+			label.Image = candidate
+			local success = false
+			pcall(function()
+				ContentProvider:PreloadAsync({ label }, function(_, status)
+					if status == Enum.AssetFetchStatus.Success then
+						success = true
+					end
+				end)
+			end)
+			if success or label.IsLoaded then
+				if onDone then
+					onDone(true)
+				end
+				return
+			end
+		end
+		label.Visible = false
+		if onDone then
+			onDone(false)
+		end
+	end)
+end
+
+-- Prevent duplicate GUIs (the old one cleans up its own connections + restores lighting on Destroy)
+local existingGui = playerGui:FindFirstChild(GUI_NAME)
+if existingGui then
+	existingGui:Destroy()
+end
+
+-- ============================================================================
+-- Defaults / state
+-- ============================================================================
+
+local DEFAULT_LIGHTING = {
+	FogColor = Lighting.FogColor,
+	FogStart = Lighting.FogStart,
+	FogEnd = Lighting.FogEnd,
+	Brightness = Lighting.Brightness,
+	Ambient = Lighting.Ambient,
+	OutdoorAmbient = Lighting.OutdoorAmbient,
+	ClockTime = Lighting.ClockTime,
+}
+
+local FOG_OFF_DISTANCE = 1e7
+
+local fogEnabled = true
+local userFogEnd = DEFAULT_LIGHTING.FogEnd
+local fadeTime = DEFAULT_FADE_TIME
+
+-- Properties the user has touched. They get re-applied every frame so the game can't override them.
+local forced = {}
+
+-- Hide the game's Atmosphere (it overrides Lighting fog) and bring it back later
+local hiddenAtmospheres = {}
+local atmosphereConn
+
+local function hideAtmosphere(obj)
+	if obj:IsA("Atmosphere") and hiddenAtmospheres[obj] == nil then
+		hiddenAtmospheres[obj] = obj.Parent
+		obj.Parent = nil
+	end
+end
+
+local function suppressAtmosphere()
+	if atmosphereConn then
+		return
+	end
+	for _, child in ipairs(Lighting:GetChildren()) do
+		hideAtmosphere(child)
+	end
+	-- if the game re-adds an Atmosphere later, hide that too
+	atmosphereConn = Lighting.ChildAdded:Connect(hideAtmosphere)
+end
+
+local function restoreAtmosphere()
+	if atmosphereConn then
+		atmosphereConn:Disconnect()
+		atmosphereConn = nil
+	end
+	for atmo, parent in pairs(hiddenAtmospheres) do
+		pcall(function()
+			atmo.Parent = parent
+		end)
+	end
+	table.clear(hiddenAtmospheres)
+end
+
+local function setLighting(prop, value)
+	forced[prop] = value
+	if prop == "FogColor" or prop == "FogStart" or prop == "FogEnd" then
+		suppressAtmosphere()
+	end
+	Lighting[prop] = value
+end
+
+local function applyFogEnd()
+	setLighting("FogEnd", fogEnabled and userFogEnd or FOG_OFF_DISTANCE)
+end
+
+local transitionToken = 0 -- bumping this cancels a running fade
+
+local function restoreDefaults()
+	transitionToken += 1
+	table.clear(forced)
+	restoreAtmosphere()
+	Lighting.FogColor = DEFAULT_LIGHTING.FogColor
+	Lighting.FogStart = DEFAULT_LIGHTING.FogStart
+	Lighting.FogEnd = DEFAULT_LIGHTING.FogEnd
+	Lighting.Brightness = DEFAULT_LIGHTING.Brightness
+	Lighting.Ambient = DEFAULT_LIGHTING.Ambient
+	Lighting.OutdoorAmbient = DEFAULT_LIGHTING.OutdoorAmbient
+	Lighting.ClockTime = DEFAULT_LIGHTING.ClockTime
+	fogEnabled = true
+	userFogEnd = DEFAULT_LIGHTING.FogEnd
+end
+
+-- ============================================================================
+-- Themes
+-- ============================================================================
+-- Every UI color is a key from these palettes:
+--   Deep / Dark / Accent / Lace / Soft  -> the main color ramp
+--   Spark   -> little sparkle accent color
+--   CardBg  -> card backgrounds
+--   GreyTop / Bottom -> top and bottom of the window gradient
+--   SwitchOff -> switch "off" color
+--   TextDark / TextMuted / TextLight -> text colors
+
+local rgb = Color3.fromRGB
+local WHITE = rgb(255, 255, 255)
+local BLACK = rgb(0, 0, 0)
+
+local THEME_ORDER = { "Matcha", "Sakura", "Coffee", "Fall", "Ocean", "Lavender", "Cloud", "Midnight" }
+
+local THEMES = {
+	Matcha = {
+		name = "Matcha",
+		icon = "🍵",
+		leaf = "🍃",
+		blossom = "🌸",
+		mood = "matcha_mist", -- fog preset used when "Sync fog with theme" is on
+		colors = {
+			Deep = rgb(84, 115, 78),
+			Dark = rgb(115, 148, 108),
+			Accent = rgb(152, 186, 142),
+			Lace = rgb(170, 204, 160),
+			Soft = rgb(224, 238, 218),
+			Spark = rgb(255, 170, 190),
+			CardBg = rgb(255, 255, 255),
+			GreyTop = rgb(196, 200, 206),
+			SwitchOff = rgb(205, 210, 202),
+			TextDark = rgb(42, 52, 40),
+			TextMuted = rgb(110, 125, 105),
+			TextLight = rgb(255, 255, 255),
+		},
+	},
+	Sakura = {
+		name = "Sakura",
+		icon = "🌸",
+		leaf = "🌷",
+		blossom = "🎀",
+		mood = "sakura_dream",
+		colors = {
+			Deep = rgb(176, 76, 108),
+			Dark = rgb(226, 128, 158),
+			Accent = rgb(247, 170, 194),
+			Lace = rgb(255, 196, 214),
+			Soft = rgb(255, 232, 240),
+			Spark = rgb(190, 225, 170),
+			CardBg = rgb(255, 252, 253),
+			GreyTop = rgb(210, 198, 204),
+			SwitchOff = rgb(232, 205, 214),
+			TextDark = rgb(66, 40, 50),
+			TextMuted = rgb(150, 110, 125),
+			TextLight = rgb(255, 255, 255),
+		},
+	},
+	Coffee = {
+		name = "Coffee",
+		icon = "☕",
+		leaf = "🥐",
+		blossom = "🤎",
+		mood = "cozy_latte",
+		colors = {
+			Deep = rgb(94, 64, 48),
+			Dark = rgb(140, 98, 74),
+			Accent = rgb(178, 138, 108),
+			Lace = rgb(196, 160, 130),
+			Soft = rgb(240, 226, 210),
+			Spark = rgb(255, 214, 160),
+			CardBg = rgb(255, 252, 248),
+			GreyTop = rgb(204, 196, 190),
+			SwitchOff = rgb(214, 202, 192),
+			TextDark = rgb(52, 36, 28),
+			TextMuted = rgb(130, 104, 88),
+			TextLight = rgb(255, 255, 255),
+		},
+	},
+	Fall = {
+		name = "Fall",
+		icon = "🍂",
+		leaf = "🍁",
+		blossom = "🎃",
+		mood = "autumn_haze",
+		colors = {
+			Deep = rgb(156, 72, 28),
+			Dark = rgb(204, 106, 44),
+			Accent = rgb(230, 148, 70),
+			Lace = rgb(240, 172, 96),
+			Soft = rgb(255, 236, 208),
+			Spark = rgb(255, 205, 80),
+			CardBg = rgb(255, 252, 246),
+			GreyTop = rgb(210, 200, 188),
+			SwitchOff = rgb(228, 212, 194),
+			TextDark = rgb(70, 38, 20),
+			TextMuted = rgb(150, 104, 72),
+			TextLight = rgb(255, 255, 255),
+		},
+	},
+}
+
+THEMES.Ocean = {
+	name = "Ocean",
+	icon = "🌊",
+	leaf = "🐚",
+	blossom = "🐠",
+	mood = "ocean_mist",
+	colors = {
+		Deep = rgb(40, 100, 140),
+		Dark = rgb(80, 150, 190),
+		Accent = rgb(130, 190, 220),
+		Lace = rgb(160, 210, 230),
+		Soft = rgb(222, 240, 248),
+		Spark = rgb(255, 214, 170),
+		CardBg = rgb(252, 254, 255),
+		GreyTop = rgb(196, 205, 214),
+		SwitchOff = rgb(200, 212, 222),
+		TextDark = rgb(30, 50, 66),
+		TextMuted = rgb(100, 125, 145),
+		TextLight = rgb(255, 255, 255),
+	},
+}
+
+THEMES.Lavender = {
+	name = "Lavender",
+	icon = "💜",
+	leaf = "🦋",
+	blossom = "✨",
+	mood = "lavender_haze",
+	colors = {
+		Deep = rgb(110, 80, 160),
+		Dark = rgb(160, 130, 205),
+		Accent = rgb(190, 165, 228),
+		Lace = rgb(208, 188, 238),
+		Soft = rgb(238, 230, 250),
+		Spark = rgb(255, 196, 220),
+		CardBg = rgb(254, 252, 255),
+		GreyTop = rgb(205, 198, 214),
+		SwitchOff = rgb(220, 212, 232),
+		TextDark = rgb(52, 40, 74),
+		TextMuted = rgb(130, 114, 160),
+		TextLight = rgb(255, 255, 255),
+	},
+}
+
+THEMES.Cloud = {
+	name = "Cloud",
+	icon = "☁️",
+	leaf = "❄️",
+	blossom = "🤍",
+	mood = "foggy_morning",
+	colors = {
+		Deep = rgb(90, 100, 120),
+		Dark = rgb(130, 142, 165),
+		Accent = rgb(165, 176, 198),
+		Lace = rgb(190, 200, 220),
+		Soft = rgb(232, 236, 244),
+		Spark = rgb(255, 190, 205),
+		CardBg = rgb(255, 255, 255),
+		GreyTop = rgb(205, 208, 214),
+		SwitchOff = rgb(212, 216, 224),
+		TextDark = rgb(40, 46, 60),
+		TextMuted = rgb(115, 124, 142),
+		TextLight = rgb(255, 255, 255),
+	},
+}
+
+THEMES.Midnight = {
+	name = "Midnight",
+	icon = "🌙",
+	leaf = "⭐",
+	blossom = "🌌",
+	mood = "starry_night",
+	colors = { -- dark UI: light text on dark cards
+		Deep = rgb(196, 176, 255),
+		Dark = rgb(120, 100, 200),
+		Accent = rgb(150, 130, 225),
+		Lace = rgb(70, 60, 110),
+		Soft = rgb(58, 52, 88),
+		Spark = rgb(255, 190, 220),
+		CardBg = rgb(40, 36, 60),
+		GreyTop = rgb(46, 42, 70),
+		Bottom = rgb(30, 27, 46),
+		SwitchOff = rgb(80, 74, 110),
+		TextDark = rgb(235, 232, 250),
+		TextMuted = rgb(160, 154, 190),
+		TextLight = rgb(255, 255, 255),
+	},
+}
+
+-- "Bottom" = bottom of the window gradient (white on every light theme)
+for _, themeData in pairs(THEMES) do
+	themeData.colors.Bottom = themeData.colors.Bottom or WHITE
+end
+
+local currentTheme = THEMES[DEFAULT_THEME] and DEFAULT_THEME or "Matcha"
+
+-- Live palette (copied from the active theme)
+local PALETTE = {}
+for key, color in pairs(THEMES[currentTheme].colors) do
+	PALETTE[key] = color
+end
+
+local FULL = UDim.new(1, 0)
+local FONT = Enum.Font.FredokaOne -- fallback look until a custom font is loaded
+
+-- ============================================================================
+-- Theme bindings
+-- ============================================================================
+-- Anywhere a color is given as a string (e.g. BackgroundColor3 = "Dark") it is
+-- looked up in PALETTE and re-colored automatically when the theme changes.
+
+local bindings = {} -- { instance, property, paletteKey }
+local gradientBindings = {} -- { gradient, colorOrKeyA, colorOrKeyB }
+local themeHooks = {} -- extra functions that run when the theme changes
+
+local function resolve(colorOrKey)
+	if type(colorOrKey) == "string" then
+		return PALETTE[colorOrKey]
+	end
+	return colorOrKey
+end
+
+local function bind(inst, prop, colorOrKey)
+	if type(colorOrKey) == "string" then
+		table.insert(bindings, { inst, prop, colorOrKey })
+	end
+	inst[prop] = resolve(colorOrKey)
+end
+
+local function onTheme(fn)
+	table.insert(themeHooks, fn)
+	fn()
+end
+
+-- ============================================================================
+-- Small helpers
+-- ============================================================================
+
+local connections = {} -- only global (UserInputService / RunService) connections need manual cleanup
+
+local function track(connection)
+	table.insert(connections, connection)
+	return connection
+end
+
+-- Re-apply the user's settings every frame (runs last before rendering)
+track(RunService.RenderStepped:Connect(function()
+	for prop, value in pairs(forced) do
+		if Lighting[prop] ~= value then
+			Lighting[prop] = value
+		end
+	end
+end))
+
+local menuTexts = {} -- every menu text that uses FONT (the font changer restyles these)
+
+local function create(className, props)
+	local inst = Instance.new(className)
+	for key, value in pairs(props) do
+		if key ~= "Parent" then
+			if type(value) == "string" and string.sub(key, -6) == "Color3" then
+				bind(inst, key, value) -- themed color
+			else
+				inst[key] = value
+			end
+		end
+	end
+	if props.Font == FONT then
+		table.insert(menuTexts, inst)
+	end
+	inst.Parent = props.Parent -- parent last = fewer property-change events
+	return inst
+end
+
+local function round(inst, radius)
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = radius
+	corner.Parent = inst
+	return corner
+end
+
+local function stroke(inst, color, thickness)
+	local s = Instance.new("UIStroke")
+	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border -- outline the frame/button, not its text
+	bind(s, "Color", color)
+	s.Thickness = thickness
+	s.Parent = inst
+	return s
+end
+
+local function padding(inst, left, right, top, bottom)
+	return create("UIPadding", {
+		PaddingLeft = UDim.new(0, left or 0),
+		PaddingRight = UDim.new(0, right or left or 0),
+		PaddingTop = UDim.new(0, top or 0),
+		PaddingBottom = UDim.new(0, bottom or top or 0),
+		Parent = inst,
+	})
+end
+
+-- NOTE: a UIGradient also tints TEXT of the object it sits on, so gradients are only
+-- ever put on text-free frames (buttons use a gradient "face" with a transparent button on top).
+local function gradient(parent, colorA, colorB, rotation)
+	local g = Instance.new("UIGradient")
+	g.Rotation = rotation or 0
+	g.Color = ColorSequence.new(resolve(colorA), resolve(colorB))
+	g.Parent = parent
+	table.insert(gradientBindings, { g, colorA, colorB })
+	return g
+end
+
+local function isPress(input)
+	return input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch
+end
+
+local function isMove(input)
+	return input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch
+end
+
+local function playSound(soundId, volume, speed)
+	local sound = Instance.new("Sound")
+	sound.SoundId = soundId
+	sound.Volume = volume or 0.5
+	sound.PlaybackSpeed = speed or 1
+	sound.Parent = SoundService
+	sound.Ended:Connect(function()
+		sound:Destroy()
+	end)
+	sound:Play()
+	task.delay(6, function()
+		if sound.Parent then
+			sound:Destroy()
+		end
+	end)
+end
+
+-- Squishy hover / press feedback. Events come from `button`, the scale is applied to `target`.
+local function addHover(button, hoverScale, target)
+	hoverScale = hoverScale or 1.08
+	local scale = create("UIScale", { Parent = target or button })
+	local info = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	local function to(value)
+		TweenService:Create(scale, info, { Scale = value }):Play()
+	end
+	button.MouseEnter:Connect(function()
+		to(hoverScale)
+	end)
+	button.MouseLeave:Connect(function()
+		to(1)
+	end)
+	button.MouseButton1Down:Connect(function()
+		to(0.94)
+	end)
+	button.MouseButton1Up:Connect(function()
+		to(hoverScale)
+	end)
+	button.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch then
+			to(1)
+		end
+	end)
+end
+
+-- ============================================================================
+-- ScreenGui
+-- ============================================================================
+
+local screenGui = create("ScreenGui", {
+	Name = GUI_NAME,
+	ResetOnSpawn = false,
+	IgnoreGuiInset = true,
+	DisplayOrder = 1000, -- above the game's own GUIs
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	Parent = playerGui,
+})
+
+local cleanupHooks = {} -- extra functions that run when the GUI is destroyed
+
+screenGui.Destroying:Connect(function()
+	for _, connection in ipairs(connections) do
+		connection:Disconnect()
+	end
+	table.clear(connections)
+	for _, hook in ipairs(cleanupHooks) do
+		pcall(hook)
+	end
+	restoreDefaults()
+end)
+
+-- ============================================================================
+-- Draggable (mouse + touch, clamped to the screen, click-vs-drag aware)
+-- ============================================================================
+
+local function makeDraggable(guiObject, handle)
+	handle = handle or guiObject
+	local state = { Moved = false }
+	local dragging = false
+	local dragStart, startPos
+
+	handle.InputBegan:Connect(function(input)
+		if isPress(input) then
+			dragging = true
+			state.Moved = false
+			dragStart = input.Position
+			startPos = guiObject.AbsolutePosition
+		end
+	end)
+
+	track(UserInputService.InputChanged:Connect(function(input)
+		if dragging and isMove(input) then
+			local delta = input.Position - dragStart
+			if delta.Magnitude > 5 then
+				state.Moved = true
+			end
+			if state.Moved then
+				local screenSize = screenGui.AbsoluteSize
+				local size = guiObject.AbsoluteSize
+				local x = math.clamp(startPos.X + delta.X, 0, math.max(0, screenSize.X - size.X))
+				local y = math.clamp(startPos.Y + delta.Y, 0, math.max(0, screenSize.Y - size.Y))
+				guiObject.Position = UDim2.fromOffset(x, y)
+			end
+		end
+	end))
+
+	track(UserInputService.InputEnded:Connect(function(input)
+		if isPress(input) then
+			dragging = false
+		end
+	end))
+
+	return state
+end
+
+-- ============================================================================
+-- Toast notifications (slide in from the top, little chime)
+-- ============================================================================
+
+local activeFace -- the Font object the menu currently uses (nil = built-in look)
+local activeToast
+
+local function notify(text, icon, silent, duration)
+	if activeToast then
+		activeToast:Destroy()
+		activeToast = nil
+	end
+
+	local toast = create("Frame", {
+		Name = "Toast",
+		Size = UDim2.fromOffset(290, 50),
+		AnchorPoint = Vector2.new(0.5, 0),
+		Position = UDim2.new(0.5, 0, 0, -70),
+		BackgroundColor3 = PALETTE.CardBg,
+		BorderSizePixel = 0,
+		ZIndex = 100,
+		Parent = screenGui,
+	})
+	activeToast = toast
+	round(toast, UDim.new(0, 16))
+	local toastStroke = Instance.new("UIStroke")
+	toastStroke.Color = PALETTE.Dark
+	toastStroke.Thickness = 2.5
+	toastStroke.Parent = toast
+
+	local badge = create("Frame", {
+		Size = UDim2.fromOffset(34, 34),
+		Position = UDim2.new(0, 9, 0.5, -17),
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+		ZIndex = 101,
+		Parent = toast,
+	})
+	round(badge, FULL)
+	local badgeGradient = Instance.new("UIGradient")
+	badgeGradient.Rotation = 90
+	badgeGradient.Color = ColorSequence.new(PALETTE.Accent, PALETTE.Dark)
+	badgeGradient.Parent = badge
+
+	create("TextLabel", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = icon or "✨",
+		TextSize = 18,
+		ZIndex = 102,
+		Parent = badge,
+	})
+
+	local label = create("TextLabel", {
+		Size = UDim2.new(1, -62, 1, 0),
+		Position = UDim2.new(0, 52, 0, 0),
+		BackgroundTransparency = 1,
+		Text = text,
+		TextColor3 = PALETTE.TextDark,
+		TextSize = 15,
+		Font = Enum.Font.GothamBold, -- (not FONT, so it isn't tracked) restyled right below
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		ZIndex = 101,
+		Parent = toast,
+	})
+	if activeFace then
+		label.FontFace = activeFace
+	end
+
+	if not silent then
+		playSound(NOTIFY_SOUND_ID, 0.4, 1)
+	end
+
+	TweenService:Create(
+		toast,
+		TweenInfo.new(0.45, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+		{ Position = UDim2.new(0.5, 0, 0, 18) }
+	):Play()
+
+	task.delay(duration or 3.2, function()
+		if activeToast ~= toast or not toast.Parent then
+			return
+		end
+		local out = TweenService:Create(
+			toast,
+			TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+			{ Position = UDim2.new(0.5, 0, 0, -70) }
+		)
+		out:Play()
+		out.Completed:Wait()
+		if activeToast == toast then
+			activeToast = nil
+		end
+		toast:Destroy()
+	end)
+end
+
+-- ============================================================================
+-- Floating toggle button (icon changes with the theme)
+-- ============================================================================
+
+local toggleBtn = create("TextButton", {
+	Name = "ToggleOpenButton",
+	Size = UDim2.fromOffset(54, 54),
+	Position = UDim2.new(0, 20, 0.4, 0),
+	BackgroundColor3 = WHITE,
+	Text = THEMES[currentTheme].icon,
+	TextSize = 26,
+	AutoButtonColor = false,
+	Parent = screenGui,
+})
+round(toggleBtn, FULL)
+gradient(toggleBtn, "Accent", "Dark", 90)
+stroke(toggleBtn, WHITE, 3)
+addHover(toggleBtn, 1.1)
+local toggleDrag = makeDraggable(toggleBtn)
+
+-- ============================================================================
+-- Window: soft shadow -> themed frame -> main frame
+-- ============================================================================
+
+local root = create("Frame", {
+	Name = "WindowRoot",
+	Size = UDim2.new(0, 340, 0.82, 0),
+	Position = UDim2.new(0.5, -170, 0.09, 0),
+	BackgroundTransparency = 1,
+	Visible = true,
+	Parent = screenGui,
+})
+create("UISizeConstraint", {
+	MinSize = Vector2.new(280, 300),
+	MaxSize = Vector2.new(340, 620),
+	Parent = root,
+})
+local uiScale = create("UIScale", { Parent = root })
+
+-- two stacked translucent frames = cheap soft drop shadow
+do
+local shadowFar = create("Frame", {
+	Size = UDim2.new(1, 14, 1, 14),
+	Position = UDim2.fromOffset(-7, -1),
+	BackgroundColor3 = BLACK,
+	BackgroundTransparency = 0.93,
+	BorderSizePixel = 0,
+	Parent = root,
+})
+round(shadowFar, UDim.new(0, 30))
+local shadowNear = create("Frame", {
+	Size = UDim2.new(1, 6, 1, 6),
+	Position = UDim2.fromOffset(-3, 3),
+	BackgroundColor3 = BLACK,
+	BackgroundTransparency = 0.86,
+	BorderSizePixel = 0,
+	Parent = root,
+})
+round(shadowNear, UDim.new(0, 27))
+end
+
+local windowFrame = create("Frame", {
+	Name = "LaceBorderFrame",
+	Size = UDim2.fromScale(1, 1),
+	BackgroundColor3 = WHITE,
+	BorderSizePixel = 0,
+	Parent = root,
+})
+round(windowFrame, UDim.new(0, 24))
+stroke(windowFrame, "Dark", 2)
+gradient(windowFrame, "Lace", "Accent", 135)
+
+local mainFrame = create("Frame", {
+	Name = "MainFrame",
+	Size = UDim2.new(1, -14, 1, -14),
+	Position = UDim2.new(0, 7, 0, 7),
+	BackgroundColor3 = WHITE,
+	BorderSizePixel = 0,
+	ClipsDescendants = true,
+	Parent = windowFrame,
+})
+round(mainFrame, UDim.new(0, 18))
+gradient(mainFrame, "GreyTop", "Bottom", 90) -- top -> bottom
+stroke(mainFrame, WHITE, 2).Transparency = 0.35
+
+-- Cute corner accents (emoji change with the theme)
+local leafAccent = create("TextLabel", {
+	Name = "LeafAccent",
+	Size = UDim2.fromOffset(44, 44),
+	Position = UDim2.new(1, -30, 0, -20),
+	BackgroundTransparency = 1,
+	Text = THEMES[currentTheme].leaf,
+	TextSize = 30,
+	Rotation = 12,
+	ZIndex = 10,
+	Parent = root,
+})
+local blossomAccent = create("TextLabel", {
+	Name = "BlossomAccent",
+	Size = UDim2.fromOffset(36, 36),
+	Position = UDim2.new(0, -14, 1, -26),
+	BackgroundTransparency = 1,
+	Text = THEMES[currentTheme].blossom,
+	TextSize = 26,
+	Rotation = -10,
+	ZIndex = 10,
+	Parent = root,
+})
+
+-- ============================================================================
+-- Title bar (drag handle)
+-- ============================================================================
+
+local TITLE_H = 58
+
+local titleBar = create("Frame", {
+	Name = "TitleBar",
+	Size = UDim2.new(1, 0, 0, TITLE_H),
+	BackgroundColor3 = WHITE,
+	BorderSizePixel = 0,
+	Parent = mainFrame,
+})
+round(titleBar, UDim.new(0, 18))
+gradient(titleBar, "Dark", "Accent")
+-- Square off the bottom corners of the title bar
+gradient(create("Frame", {
+	Size = UDim2.new(1, 0, 0, 18),
+	Position = UDim2.new(0, 0, 1, -18),
+	BackgroundColor3 = WHITE,
+	BorderSizePixel = 0,
+	Parent = titleBar,
+}), "Dark", "Accent")
+
+-- logo badge: a gear with a drop cut out of it, drawn in code so it always loads and
+-- recolors with the theme (every color below is a theme key)
+local iconBadge = create("Frame", {
+	Name = "IconBadge",
+	Size = UDim2.fromOffset(40, 40),
+	Position = UDim2.new(0, 11, 0.5, -20),
+	BackgroundColor3 = WHITE,
+	BorderSizePixel = 0,
+	ZIndex = 3,
+	Parent = titleBar,
+})
+round(iconBadge, FULL)
+stroke(iconBadge, "Lace", 2)
+
+local logo = create("Frame", {
+	Name = "Logo",
+	Size = UDim2.fromOffset(32, 32),
+	AnchorPoint = Vector2.new(0.5, 0.5),
+	Position = UDim2.fromScale(0.5, 0.5),
+	BackgroundTransparency = 1,
+	ZIndex = 4,
+	Parent = iconBadge,
+})
+do
+	-- 4 bars crossing in the middle = 8 gear teeth
+	for i = 0, 3 do
+		local tooth = create("Frame", {
+			Size = UDim2.fromOffset(7, 30),
+			AnchorPoint = Vector2.new(0.5, 0.5),
+			Position = UDim2.fromScale(0.5, 0.5),
+			Rotation = i * 45,
+			BackgroundColor3 = "Dark",
+			BorderSizePixel = 0,
+			ZIndex = 4,
+			Parent = logo,
+		})
+		round(tooth, UDim.new(0, 2))
+	end
+	-- gear body + softer inner disc
+	local body = create("Frame", {
+		Size = UDim2.fromOffset(24, 24),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		BackgroundColor3 = "Dark",
+		BorderSizePixel = 0,
+		ZIndex = 5,
+		Parent = logo,
+	})
+	round(body, FULL)
+	local disc = create("Frame", {
+		Size = UDim2.fromOffset(18, 18),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5),
+		BackgroundColor3 = "Accent",
+		BorderSizePixel = 0,
+		ZIndex = 6,
+		Parent = logo,
+	})
+	round(disc, FULL)
+	-- the drop: a circle + the top corner of a 45-degree square (clipped so only the tip shows)
+	local dropClip = create("Frame", {
+		Size = UDim2.fromOffset(14, 4),
+		Position = UDim2.fromOffset(9, 12),
+		BackgroundTransparency = 1,
+		ClipsDescendants = true,
+		ZIndex = 7,
+		Parent = logo,
+	})
+	create("Frame", {
+		Size = UDim2.fromOffset(10, 10),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromOffset(7, 7),
+		Rotation = 45,
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+		ZIndex = 7,
+		Parent = dropClip,
+	})
+	local dropBulb = create("Frame", {
+		Size = UDim2.fromOffset(10, 10),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromOffset(16, 19),
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+		ZIndex = 7,
+		Parent = logo,
+	})
+	round(dropBulb, FULL)
+end
+
+-- optional: your own image instead (tinted with the theme color); falls back to the drawn logo
+local titleIcon
+if USE_IMAGE_ICON and ICON_ID then
+	titleIcon = create("ImageLabel", {
+		Name = "TitleIcon",
+		Size = UDim2.new(1, -8, 1, -8),
+		Position = UDim2.new(0, 4, 0, 4),
+		BackgroundTransparency = 1,
+		Image = "",
+		ImageColor3 = "Dark",
+		ScaleType = Enum.ScaleType.Fit,
+		ZIndex = 8,
+		Parent = iconBadge,
+	})
+	loadIcon(titleIcon, function(success)
+		logo.Visible = not success
+	end)
+end
+
+create("TextLabel", {
+	Name = "Brand",
+	Size = UDim2.new(1, -140, 0, 12),
+	Position = UDim2.new(0, 60, 0, 10),
+	BackgroundTransparency = 1,
+	Text = "ANTHONY'S",
+	TextColor3 = "TextLight",
+	TextTransparency = 0.12,
+	TextSize = 10,
+	Font = FONT,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	ZIndex = 3,
+	Parent = titleBar,
+})
+create("TextLabel", {
+	Name = "Title",
+	Size = UDim2.new(1, -140, 0, 24),
+	Position = UDim2.new(0, 60, 0, 22),
+	BackgroundTransparency = 1,
+	Text = "Fog Color Changer",
+	TextColor3 = "TextLight",
+	TextSize = 17,
+	Font = FONT,
+	TextXAlignment = Enum.TextXAlignment.Left,
+	TextTruncate = Enum.TextTruncate.AtEnd,
+	ZIndex = 3,
+	Parent = titleBar,
+})
+
+local function titleButton(name, glyph, xOffset, size)
+	local btn = create("TextButton", {
+		Name = name,
+		Size = UDim2.fromOffset(30, 30),
+		Position = UDim2.new(1, xOffset, 0.5, -15),
+		BackgroundColor3 = WHITE,
+		BackgroundTransparency = 0.7,
+		Text = glyph,
+		TextColor3 = "TextLight",
+		TextSize = size,
+		Font = Enum.Font.GothamBold, -- symbol, not affected by the font changer
+		AutoButtonColor = false,
+		ZIndex = 3,
+		Parent = titleBar,
+	})
+	round(btn, FULL)
+	addHover(btn, 1.12)
+	return btn
+end
+
+local resetBtn = titleButton("ResetButton", "↻", -78, 17)
+local closeBtn = titleButton("CloseButton", "✕", -42, 13)
+
+makeDraggable(root, titleBar)
+
+-- Open / close with a little pop animation
+local function setOpen(open)
+	if open then
+		root.Visible = true
+		uiScale.Scale = 0.88
+		TweenService:Create(
+			uiScale,
+			TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+			{ Scale = 1 }
+		):Play()
+	else
+		root.Visible = false
+	end
+end
+
+toggleBtn.MouseButton1Click:Connect(function()
+	if toggleDrag.Moved then
+		return -- it was a drag, not a click
+	end
+	playSound(CLICK_SOUND_ID, 0.35, 1.3)
+	setOpen(not root.Visible)
+end)
+closeBtn.MouseButton1Click:Connect(function()
+	playSound(CLICK_SOUND_ID, 0.3, 1.1)
+	setOpen(false)
+end)
+
+-- ============================================================================
+-- Theme switching
+-- ============================================================================
+
+local function applyTheme(themeName)
+	local theme = THEMES[themeName]
+	if not theme then
+		return
+	end
+	currentTheme = themeName
+
+	for key, color in pairs(theme.colors) do
+		PALETTE[key] = color
+	end
+	for _, entry in ipairs(bindings) do
+		entry[1][entry[2]] = PALETTE[entry[3]]
+	end
+	for _, entry in ipairs(gradientBindings) do
+		entry[1].Color = ColorSequence.new(resolve(entry[2]), resolve(entry[3]))
+	end
+
+	toggleBtn.Text = theme.icon
+	leafAccent.Text = theme.leaf
+	blossomAccent.Text = theme.blossom
+
+	for _, hook in ipairs(themeHooks) do
+		hook()
+	end
+
+	-- tiny pop so the change feels good
+	if root.Visible then
+		uiScale.Scale = 0.97
+		TweenService:Create(
+			uiScale,
+			TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+			{ Scale = 1 }
+		):Play()
+	end
+end
+
+-- ============================================================================
+-- Tabs + pages
+-- ============================================================================
+
+local TAB_DEFS = {
+	{ id = "presets", icon = "🌈", label = "Presets" },
+	{ id = "fog", icon = "🌫️", label = "Fog" },
+	{ id = "light", icon = "💡", label = "Light" },
+	{ id = "style", icon = "🎀", label = "Style" },
+}
+
+local TABS_Y = TITLE_H + 8
+local TABS_H = 46
+local CONTENT_Y = TABS_Y + TABS_H + 6
+local FOOTER_H = 24
+
+local tabBar = create("Frame", {
+	Name = "TabBar",
+	Size = UDim2.new(1, -24, 0, TABS_H),
+	Position = UDim2.new(0, 12, 0, TABS_Y),
+	BackgroundColor3 = "Soft",
+	BorderSizePixel = 0,
+	Parent = mainFrame,
+})
+round(tabBar, UDim.new(0, 16))
+
+local tabIndicator = create("Frame", {
+	Name = "TabIndicator",
+	Size = UDim2.new(1 / #TAB_DEFS, -6, 1, -8),
+	Position = UDim2.new(0, 3, 0, 4),
+	BackgroundColor3 = "CardBg",
+	BorderSizePixel = 0,
+	ZIndex = 1,
+	Parent = tabBar,
+})
+round(tabIndicator, UDim.new(0, 12))
+stroke(tabIndicator, "Lace", 1.5)
+
+local content = create("Frame", {
+	Name = "Content",
+	Size = UDim2.new(1, 0, 1, -(CONTENT_Y + FOOTER_H)),
+	Position = UDim2.new(0, 0, 0, CONTENT_Y),
+	BackgroundTransparency = 1,
+	ClipsDescendants = true,
+	Parent = mainFrame,
+})
+
+create("TextLabel", {
+	Name = "Footer",
+	Size = UDim2.new(1, 0, 0, FOOTER_H),
+	Position = UDim2.new(0, 0, 1, -FOOTER_H),
+	BackgroundTransparency = 1,
+	Text = "RightShift  •  open / close      drag the title bar to move",
+	TextColor3 = "TextMuted",
+	TextSize = 10,
+	Font = FONT,
+	Parent = mainFrame,
+})
+
+local pages = {} -- id -> ScrollingFrame
+local tabParts = {} -- id -> { emoji, label }
+local currentTabId
+local currentPage -- widgets are built into this page
+
+local function newPage(id)
+	local page = create("ScrollingFrame", {
+		Name = "Page_" .. id,
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		BorderSizePixel = 0,
+		ScrollBarThickness = 4,
+		ScrollBarImageColor3 = "Dark",
+		ScrollBarImageTransparency = 0.25,
+		CanvasSize = UDim2.new(),
+		AutomaticCanvasSize = Enum.AutomaticSize.Y,
+		ScrollingDirection = Enum.ScrollingDirection.Y,
+		Visible = false,
+		Parent = content,
+	})
+	create("UIListLayout", {
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, 9),
+		Parent = page,
+	})
+	padding(page, 12, 14, 6, 14)
+	pages[id] = page
+	return page
+end
+
+local layoutOrder = 0
+local function usePage(page)
+	currentPage = page
+	layoutOrder = 0
+end
+
+local function nextOrder()
+	layoutOrder += 1
+	return layoutOrder
+end
+
+local function refreshTabs()
+	for _, def in ipairs(TAB_DEFS) do
+		local parts = tabParts[def.id]
+		local on = def.id == currentTabId
+		parts.label.TextColor3 = on and PALETTE.Deep or PALETTE.TextMuted
+		parts.emoji.TextTransparency = on and 0 or 0.4
+	end
+end
+
+local function selectTab(id, instant)
+	local index = 1
+	for i, def in ipairs(TAB_DEFS) do
+		if def.id == id then
+			index = i
+		end
+	end
+
+	local changed = currentTabId ~= id
+	currentTabId = id
+
+	for _, def in ipairs(TAB_DEFS) do
+		local page = pages[def.id]
+		if def.id == id then
+			page.Visible = true
+			if changed and not instant then
+				page.Position = UDim2.fromOffset(0, 12)
+				TweenService:Create(
+					page,
+					TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+					{ Position = UDim2.fromOffset(0, 0) }
+				):Play()
+			end
+		else
+			page.Visible = false
+		end
+	end
+
+	local goal = UDim2.new((index - 1) / #TAB_DEFS, 3, 0, 4)
+	if instant then
+		tabIndicator.Position = goal
+	else
+		TweenService:Create(
+			tabIndicator,
+			TweenInfo.new(0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+			{ Position = goal }
+		):Play()
+	end
+	refreshTabs()
+end
+
+for i, def in ipairs(TAB_DEFS) do
+	newPage(def.id)
+
+	local btn = create("TextButton", {
+		Name = "Tab_" .. def.id,
+		Size = UDim2.new(1 / #TAB_DEFS, 0, 1, 0),
+		Position = UDim2.new((i - 1) / #TAB_DEFS, 0, 0, 0),
+		BackgroundTransparency = 1,
+		Text = "",
+		AutoButtonColor = false,
+		ZIndex = 2,
+		Parent = tabBar,
+	})
+	local emoji = create("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 22),
+		Position = UDim2.new(0, 0, 0, 4),
+		BackgroundTransparency = 1,
+		Text = def.icon,
+		TextSize = 17,
+		ZIndex = 3,
+		Parent = btn,
+	})
+	local label = create("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 14),
+		Position = UDim2.new(0, 0, 0, 27),
+		BackgroundTransparency = 1,
+		Text = def.label,
+		TextColor3 = PALETTE.TextMuted,
+		TextSize = 11,
+		Font = FONT,
+		ZIndex = 3,
+		Parent = btn,
+	})
+	tabParts[def.id] = { emoji = emoji, label = label }
+
+	btn.MouseButton1Click:Connect(function()
+		if currentTabId ~= def.id then
+			playSound(CLICK_SOUND_ID, 0.3, 1.25)
+			selectTab(def.id)
+		end
+	end)
+end
+onTheme(refreshTabs)
+
+-- ============================================================================
+-- Layout helpers + widgets
+-- ============================================================================
+
+local function newCard(height)
+	local card = create("Frame", {
+		Size = UDim2.new(1, 0, 0, height),
+		BackgroundColor3 = "CardBg",
+		BorderSizePixel = 0,
+		LayoutOrder = nextOrder(),
+		Parent = currentPage,
+	})
+	round(card, UDim.new(0, 14))
+	stroke(card, "Soft", 1.5)
+	return card
+end
+
+-- a card that grows with its content
+local function newAutoCard()
+	local card = create("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundColor3 = "CardBg",
+		BorderSizePixel = 0,
+		LayoutOrder = nextOrder(),
+		Parent = currentPage,
+	})
+	round(card, UDim.new(0, 14))
+	stroke(card, "Soft", 1.5)
+	return card
+end
+
+-- Mobile-friendly drag: locks the page's scrolling while you drag so sliders don't scroll the window
+local function bindDrag(target, onUpdate)
+	local page = currentPage
+	local dragging = false
+
+	target.InputBegan:Connect(function(input)
+		if isPress(input) then
+			dragging = true
+			page.ScrollingEnabled = false
+			onUpdate(input)
+		end
+	end)
+
+	track(UserInputService.InputChanged:Connect(function(input)
+		if dragging and isMove(input) then
+			onUpdate(input)
+		end
+	end))
+
+	track(UserInputService.InputEnded:Connect(function(input)
+		if dragging and isPress(input) then
+			dragging = false
+			page.ScrollingEnabled = true
+		end
+	end))
+end
+
+local function createSectionHeader(title, subtitle)
+	local holder = create("Frame", {
+		Size = UDim2.new(1, 0, 0, subtitle and 40 or 24),
+		BackgroundTransparency = 1,
+		LayoutOrder = nextOrder(),
+		Parent = currentPage,
+	})
+	-- little accent pill before the title
+	local pill = create("Frame", {
+		Size = UDim2.fromOffset(4, 16),
+		Position = UDim2.new(0, 2, 0, 4),
+		BackgroundColor3 = "Dark",
+		BorderSizePixel = 0,
+		Parent = holder,
+	})
+	round(pill, FULL)
+	create("TextLabel", {
+		Size = UDim2.new(1, -16, 0, 24),
+		Position = UDim2.new(0, 14, 0, 0),
+		BackgroundTransparency = 1,
+		Text = title,
+		TextColor3 = "Deep",
+		TextSize = 15,
+		Font = FONT,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = holder,
+	})
+	if subtitle then
+		create("TextLabel", {
+			Size = UDim2.new(1, -16, 0, 14),
+			Position = UDim2.new(0, 14, 0, 22),
+			BackgroundTransparency = 1,
+			Text = subtitle,
+			TextColor3 = "TextMuted",
+			TextSize = 11,
+			Font = FONT,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Parent = holder,
+		})
+	end
+	return holder
+end
+
+-- A pill button: gradient "face" + a transparent button on top (so the gradient never tints the text)
+local function makeTile(parent, o)
+	local face = create("Frame", {
+		BackgroundColor3 = o.color2 and WHITE or o.color,
+		BorderSizePixel = 0,
+		LayoutOrder = o.order,
+		Size = o.size,
+		Position = o.position,
+		Parent = parent,
+	})
+	round(face, UDim.new(0, o.radius or 12))
+	if o.color2 then
+		gradient(face, o.color, o.color2, 90)
+	end
+	local outline = stroke(face, o.stroke or WHITE, o.strokeThickness or 2)
+	local btn = create("TextButton", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = o.text,
+		TextColor3 = o.textColor or "TextLight",
+		TextSize = o.textSize or 13,
+		Font = o.font or FONT,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		AutoButtonColor = false,
+		Parent = face,
+	})
+	padding(btn, 8, 8, 0, 0)
+	addHover(btn, o.hover or 1.05, face)
+	return face, btn, outline
+end
+
+local function createActionButton(text, callback)
+	local card = newCard(50)
+	local _, btn = makeTile(card, {
+		text = text,
+		color = "Dark",
+		color2 = "Accent",
+		textSize = 14,
+		size = UDim2.new(1, -16, 1, -16),
+		position = UDim2.new(0, 8, 0, 8),
+		strokeThickness = 0,
+		hover = 1.03,
+	})
+	btn.MouseButton1Click:Connect(function()
+		playSound(CLICK_SOUND_ID, 0.35, 1.4)
+		callback()
+	end)
+end
+
+local function createToggleSwitch(name, initialState, callback, hint)
+	local card = newCard(hint and 56 or 46)
+	create("TextLabel", {
+		Size = UDim2.new(1, -86, 0, 18),
+		Position = UDim2.new(0, 14, 0, hint and 9 or 14),
+		BackgroundTransparency = 1,
+		Text = name,
+		TextColor3 = "TextDark",
+		TextSize = 13,
+		Font = FONT,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = card,
+	})
+	if hint then
+		create("TextLabel", {
+			Size = UDim2.new(1, -86, 0, 14),
+			Position = UDim2.new(0, 14, 0, 29),
+			BackgroundTransparency = 1,
+			Text = hint,
+			TextColor3 = "TextMuted",
+			TextSize = 10,
+			Font = FONT,
+			TextXAlignment = Enum.TextXAlignment.Left,
+			TextTruncate = Enum.TextTruncate.AtEnd,
+			Parent = card,
+		})
+	end
+
+	local state = initialState
+	local switchBtn = create("TextButton", {
+		Size = UDim2.fromOffset(48, 26),
+		AnchorPoint = Vector2.new(1, 0.5),
+		Position = UDim2.new(1, -14, 0.5, 0),
+		BackgroundColor3 = PALETTE.SwitchOff,
+		Text = "",
+		AutoButtonColor = false,
+		Parent = card,
+	})
+	round(switchBtn, FULL)
+
+	local knob = create("Frame", {
+		Size = UDim2.fromOffset(20, 20),
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+		Parent = switchBtn,
+	})
+	round(knob, FULL)
+
+	local tweenInfo = TweenInfo.new(0.18, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+	local function render(animate)
+		local colorGoal = state and PALETTE.Dark or PALETTE.SwitchOff
+		local posGoal = state and UDim2.new(1, -23, 0.5, -10) or UDim2.new(0, 3, 0.5, -10)
+		if animate then
+			TweenService:Create(switchBtn, tweenInfo, { BackgroundColor3 = colorGoal }):Play()
+			TweenService:Create(knob, tweenInfo, { Position = posGoal }):Play()
+		else
+			switchBtn.BackgroundColor3 = colorGoal
+			knob.Position = posGoal
+		end
+	end
+	render(false)
+	onTheme(function()
+		render(false) -- re-color the switch when the theme changes
+	end)
+
+	switchBtn.MouseButton1Click:Connect(function()
+		state = not state
+		render(true)
+		playSound(CLICK_SOUND_ID, 0.3, state and 1.4 or 1.1)
+		callback(state)
+	end)
+
+	return function(newState)
+		state = newState
+		render(true)
+	end
+end
+
+local function formatClock(value)
+	local total = math.floor(value * 60 + 0.5)
+	return string.format("%02d:%02d", math.floor(total / 60), total % 60)
+end
+
+local function createSlider(name, minVal, maxVal, initialVal, decimals, callback, formatFn)
+	local card = newCard(66)
+
+	local function format(value)
+		if formatFn then
+			return formatFn(value)
+		end
+		return string.format("%." .. decimals .. "f", value)
+	end
+
+	create("TextLabel", {
+		Size = UDim2.new(0.6, 0, 0, 20),
+		Position = UDim2.new(0, 14, 0, 9),
+		BackgroundTransparency = 1,
+		Text = name,
+		TextColor3 = "TextDark",
+		TextSize = 13,
+		Font = FONT,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = card,
+	})
+
+	-- value pill (top right)
+	local valuePill = create("TextLabel", {
+		Size = UDim2.fromOffset(0, 20),
+		AutomaticSize = Enum.AutomaticSize.X,
+		AnchorPoint = Vector2.new(1, 0),
+		Position = UDim2.new(1, -12, 0, 9),
+		BackgroundColor3 = "Soft",
+		BorderSizePixel = 0,
+		Text = format(initialVal),
+		TextColor3 = "Deep",
+		TextSize = 12,
+		Font = FONT,
+		Parent = card,
+	})
+	round(valuePill, FULL)
+	padding(valuePill, 10, 10, 0, 0)
+
+	-- Taller invisible hit area = easy to grab on mobile
+	local hit = create("TextButton", {
+		Size = UDim2.new(1, -28, 0, 28),
+		Position = UDim2.new(0, 14, 0, 32),
+		BackgroundTransparency = 1,
+		Text = "",
+		AutoButtonColor = false,
+		Parent = card,
+	})
+	local bar = create("Frame", {
+		Size = UDim2.new(1, 0, 0, 8),
+		Position = UDim2.new(0, 0, 0.5, -4),
+		BackgroundColor3 = "Soft",
+		BorderSizePixel = 0,
+		Parent = hit,
+	})
+	round(bar, FULL)
+
+	local fill = create("Frame", {
+		Size = UDim2.new(0, 0, 1, 0),
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+		Parent = bar,
+	})
+	round(fill, FULL)
+	gradient(fill, "Accent", "Dark", 0)
+
+	local knob = create("Frame", {
+		Size = UDim2.fromOffset(20, 20),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0, 0, 0.5, 0),
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+		ZIndex = 2,
+		Parent = hit,
+	})
+	round(knob, FULL)
+	stroke(knob, "Dark", 3)
+
+	local function setVisual(value)
+		local ratio = math.clamp((value - minVal) / (maxVal - minVal), 0, 1)
+		fill.Size = UDim2.new(ratio, 0, 1, 0)
+		knob.Position = UDim2.new(ratio, 0, 0.5, 0)
+		valuePill.Text = format(value)
+	end
+	setVisual(initialVal)
+
+	local multiplier = 10 ^ decimals
+	bindDrag(hit, function(input)
+		local ratio = math.clamp((input.Position.X - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1)
+		local value = math.round((minVal + ratio * (maxVal - minVal)) * multiplier) / multiplier
+		setVisual(value)
+		callback(value)
+	end)
+
+	return setVisual
+end
+
+-- 48 color presets: hot & vibrant / soft pastels / neutrals & earthy
+local COLOR_SHADES = {
+	-- Hot & vibrant
+	{ 255, 0, 60 }, { 220, 20, 60 }, { 255, 50, 50 }, { 255, 90, 90 },
+	{ 255, 100, 0 }, { 255, 140, 0 }, { 255, 230, 0 }, { 180, 255, 0 },
+	{ 0, 230, 100 }, { 0, 210, 190 }, { 0, 220, 255 }, { 30, 120, 255 },
+	{ 10, 60, 220 }, { 140, 40, 255 }, { 255, 0, 180 }, { 255, 20, 140 },
+	-- Soft & cute pastels
+	{ 152, 186, 142 }, { 255, 183, 197 }, { 255, 218, 185 }, { 255, 209, 220 },
+	{ 255, 190, 230 }, { 240, 160, 180 }, { 255, 200, 160 }, { 255, 245, 180 },
+	{ 190, 245, 210 }, { 200, 230, 180 }, { 180, 215, 190 }, { 180, 240, 250 },
+	{ 180, 220, 255 }, { 190, 200, 250 }, { 220, 190, 255 }, { 235, 200, 245 },
+	-- Neutrals, earthy & dark
+	{ 255, 255, 255 }, { 240, 240, 245 }, { 210, 215, 225 }, { 140, 145, 160 },
+	{ 60, 60, 70 }, { 0, 0, 0 }, { 235, 215, 190 }, { 160, 120, 100 },
+	{ 100, 70, 55 }, { 70, 40, 30 }, { 25, 25, 40 }, { 45, 30, 60 },
+}
+
+local HUE_SEQUENCE = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromHSV(0, 1, 1)),
+	ColorSequenceKeypoint.new(1 / 6, Color3.fromHSV(1 / 6, 1, 1)),
+	ColorSequenceKeypoint.new(2 / 6, Color3.fromHSV(2 / 6, 1, 1)),
+	ColorSequenceKeypoint.new(3 / 6, Color3.fromHSV(3 / 6, 1, 1)),
+	ColorSequenceKeypoint.new(4 / 6, Color3.fromHSV(4 / 6, 1, 1)),
+	ColorSequenceKeypoint.new(5 / 6, Color3.fromHSV(5 / 6, 1, 1)),
+	ColorSequenceKeypoint.new(1, Color3.fromHSV(0, 1, 1)),
+})
+
+-- One gradient bar (hue / saturation / brightness)
+local function createGradientRow(parent, labelText, order, onDrag)
+	local page = currentPage
+	local row = create("Frame", {
+		Size = UDim2.new(1, 0, 0, 42),
+		BackgroundTransparency = 1,
+		LayoutOrder = order,
+		Parent = parent,
+	})
+	create("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 14),
+		BackgroundTransparency = 1,
+		Text = labelText,
+		TextColor3 = "TextMuted",
+		TextSize = 11,
+		Font = FONT,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		Parent = row,
+	})
+	local hit = create("TextButton", {
+		Size = UDim2.new(1, 0, 0, 26),
+		Position = UDim2.new(0, 0, 0, 15),
+		BackgroundTransparency = 1,
+		Text = "",
+		AutoButtonColor = false,
+		Parent = row,
+	})
+	local bar = create("Frame", {
+		Size = UDim2.new(1, 0, 0, 12),
+		Position = UDim2.new(0, 0, 0.5, -6),
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+		Parent = hit,
+	})
+	round(bar, FULL)
+	stroke(bar, "Soft", 1)
+	local colorGradient = create("UIGradient", { Parent = bar })
+
+	local knob = create("Frame", {
+		Size = UDim2.fromOffset(20, 20),
+		AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.new(0, 0, 0.5, 0),
+		BackgroundColor3 = WHITE,
+		BorderSizePixel = 0,
+		ZIndex = 2,
+		Parent = hit,
+	})
+	round(knob, FULL)
+	stroke(knob, "Dark", 3)
+
+	currentPage = page
+	bindDrag(hit, function(input)
+		onDrag(math.clamp((input.Position.X - bar.AbsolutePosition.X) / bar.AbsoluteSize.X, 0, 1))
+	end)
+
+	return colorGradient, function(ratio)
+		knob.Position = UDim2.new(ratio, 0, 0.5, 0)
+	end
+end
+
+-- Collapsible color picker: hue / saturation / brightness bars + preset swatches
+local function createColorPicker(title, initialColor, callback)
+	local card = newAutoCard()
+	create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Parent = card })
+
+	local header = create("TextButton", {
+		Size = UDim2.new(1, 0, 0, 54),
+		BackgroundTransparency = 1,
+		Text = "",
+		AutoButtonColor = false,
+		LayoutOrder = 1,
+		Parent = card,
+	})
+	local preview = create("Frame", {
+		Size = UDim2.fromOffset(32, 32),
+		Position = UDim2.new(0, 12, 0.5, -16),
+		BackgroundColor3 = initialColor,
+		BorderSizePixel = 0,
+		Parent = header,
+	})
+	round(preview, UDim.new(0, 10))
+	stroke(preview, "Lace", 2)
+	create("TextLabel", {
+		Size = UDim2.new(1, -100, 0, 18),
+		Position = UDim2.new(0, 54, 0, 9),
+		BackgroundTransparency = 1,
+		Text = title,
+		TextColor3 = "TextDark",
+		TextSize = 13,
+		Font = FONT,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = header,
+	})
+	local rgbLabel = create("TextLabel", {
+		Size = UDim2.new(1, -100, 0, 14),
+		Position = UDim2.new(0, 54, 0, 29),
+		BackgroundTransparency = 1,
+		Text = "",
+		TextColor3 = "TextMuted",
+		TextSize = 10,
+		Font = FONT,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd,
+		Parent = header,
+	})
+	local chevronHolder = create("Frame", {
+		Size = UDim2.fromOffset(26, 26),
+		Position = UDim2.new(1, -38, 0.5, -13),
+		BackgroundColor3 = "Soft",
+		BorderSizePixel = 0,
+		Parent = header,
+	})
+	round(chevronHolder, FULL)
+	local arrow = create("TextLabel", {
+		Size = UDim2.fromScale(1, 1),
+		BackgroundTransparency = 1,
+		Text = "▾",
+		TextColor3 = "Deep",
+		TextSize = 15,
+		Font = Enum.Font.GothamBold, -- symbol, not affected by the font changer
+		Parent = chevronHolder,
+	})
+
+	local body = create("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		Visible = false,
+		LayoutOrder = 2,
+		Parent = card,
+	})
+	create("UIListLayout", {
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Padding = UDim.new(0, 4),
+		Parent = body,
+	})
+	padding(body, 14, 14, 0, 14)
+
+	local h, s, v = initialColor:ToHSV()
+	local refresh
+
+	local hueGradient, setHueKnob = createGradientRow(body, "Hue", 1, function(r)
+		h = r
+		refresh(true)
+	end)
+	local satGradient, setSatKnob = createGradientRow(body, "Saturation", 2, function(r)
+		s = r
+		refresh(true)
+	end)
+	local valGradient, setValKnob = createGradientRow(body, "Brightness", 3, function(r)
+		v = r
+		refresh(true)
+	end)
+	hueGradient.Color = HUE_SEQUENCE
+
+	refresh = function(fire)
+		local color = Color3.fromHSV(h, s, v)
+		local r, g, b = math.round(color.R * 255), math.round(color.G * 255), math.round(color.B * 255)
+		preview.BackgroundColor3 = color
+		rgbLabel.Text = string.format("RGB %d, %d, %d   #%02X%02X%02X", r, g, b, r, g, b)
+		satGradient.Color = ColorSequence.new(Color3.fromHSV(h, 0, 1), Color3.fromHSV(h, 1, 1))
+		valGradient.Color = ColorSequence.new(Color3.fromHSV(h, s, 0), Color3.fromHSV(h, s, 1))
+		setHueKnob(h)
+		setSatKnob(s)
+		setValKnob(v)
+		if fire then
+			callback(color)
+		end
+	end
+	refresh(false)
+
+	-- Preset swatches (auto-wrapping grid, no inner scrolling needed)
+	local grid = create("Frame", {
+		Size 
+... (682 KB left)
